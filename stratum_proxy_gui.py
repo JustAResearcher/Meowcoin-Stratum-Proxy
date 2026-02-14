@@ -293,8 +293,17 @@ class StratumProxyApp:
         self.var_address, _ = add_field("Mining Address:", "")
         self.var_rpc_host, _ = add_field("RPC Host:", "127.0.0.1")
         self.var_rpc_port, _ = add_field("RPC Port:", "8332")
-        self.var_rpc_user, _ = add_field("RPC User:", "")
-        self.var_rpc_pass, _ = add_field("RPC Password:", "", show="•")
+        self.var_rpc_user, _ = add_field("RPC User:", "", width=50)
+        self.var_rpc_pass, _ = add_field("RPC Password:", "", width=50, show="•")
+
+        # Hint label — leave blank for cookie auth
+        hint_lbl = tk.Label(
+            cfg_inner,
+            text="(leave User/Password blank to use cookie auth)",
+            bg=BG_PANEL, fg=FG_DIM, font=("Segoe UI", 8, "italic"),
+        )
+        hint_lbl.grid(row=row[0], column=1, sticky="w", pady=(0, 2))
+        row[0] += 1
 
         # Cookie dir with browse button
         lbl = ttk.Label(cfg_inner, text="Cookie Dir:", style="Panel.TLabel")

@@ -501,7 +501,29 @@ class NodeRPC:
             auth=(user, pw),
             timeout=30,
         )
-        data = resp.json()
+        # Handle HTTP-level errors before trying to parse JSON
+        if resp.status_code == 401:
+            raise RuntimeError(
+                "RPC authentication failed (HTTP 401). "
+                "If using cookie auth, leave RPC User/Password blank "
+                "and set the Cookie Dir to your node's data directory."
+            )
+        if resp.status_code == 403:
+            raise RuntimeError(
+                "RPC access forbidden (HTTP 403). "
+                "Check your node's rpcallowip / rpcbind settings."
+            )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"RPC HTTP error {resp.status_code}: {resp.text[:200]}"
+            )
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError(
+                f"RPC returned invalid JSON (HTTP {resp.status_code}). "
+                f"Response body: {resp.text[:200]!r}"
+            )
         if data.get("error"):
             raise RuntimeError(f"RPC error ({method}): {data['error']}")
         return data.get("result")
