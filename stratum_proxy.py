@@ -973,8 +973,8 @@ class MinerSession:
     async def send_notify(self, job: Job, clean: bool = True):
         """
         Send mining.notify with a new job.
-        kawpow/meowpow 7-param format:
-        [job_id, header_hash, seed_hash, target, clean_jobs, height, bits]
+        meowpow 7-param format:
+        [job_id, header_hash, seed_hash, target, clean_jobs, height (int), bits]
         """
         params = [
             job.job_id,
@@ -982,7 +982,7 @@ class MinerSession:
             job.seed_hash_hex,
             job.target_hex,
             clean,
-            format(job.height, "x"),
+            job.height,                    # integer, NOT hex string
             format(job.nbits, "08x"),
         ]
         await self._send_notification("mining.notify", params)
