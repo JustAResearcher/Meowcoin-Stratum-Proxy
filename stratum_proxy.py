@@ -566,6 +566,7 @@ class Job:
         self.target_hex = target_hex
         self.header_hash_hex = header_hash_hex
         self.seed_hash_hex = seed_hash_hex
+        self.prev_hash_hex = prev_hash_internal[::-1].hex()  # big-endian display
         self.coinbase_raw = coinbase_raw
         self.tx_hex_list = tx_hex_list
         self.created = time.time()
@@ -908,7 +909,7 @@ class MinerSession:
         result = [
             [["mining.notify", self.subscription_id]],
             "",   # extranonce1 (empty for solo — miner controls full nonce)
-            "0",  # extranonce2_size
+            8,    # extranonce2_size (bytes)
         ]
         await self._send_result(msg_id, result)
 
@@ -974,15 +975,17 @@ class MinerSession:
     async def send_notify(self, job: Job, clean: bool = True):
         """
         Send mining.notify with a new job.
-        Params: [job_id, header_hash, seed_hash, target, clean_jobs, height_hex, bits_hex]
+        Standard kawpow 8-param format (NOMP-compatible):
+        [job_id, prev_hash, header_hash, seed_hash, target, clean_jobs, height, bits]
         """
         params = [
             job.job_id,
+            job.prev_hash_hex,
             job.header_hash_hex,
             job.seed_hash_hex,
             job.target_hex,
             clean,
-            format(job.height, "x"),
+            job.height,
             format(job.nbits, "08x"),
         ]
         await self._send_notification("mining.notify", params)
