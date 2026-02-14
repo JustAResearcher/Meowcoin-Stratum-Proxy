@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
-from typing import Optional
+from typing import Optional, Dict
 
 # Import the core proxy module (same directory)
 from stratum_proxy import (
@@ -31,6 +33,116 @@ from stratum_proxy import (
     EPOCH_LENGTH,
     log as proxy_log,
 )
+
+# =============================================================================
+# GPU monitoring — optional, NVIDIA (pynvml) with nvidia-smi fallback
+# =============================================================================
+
+class GpuMonitor:
+    """Query GPU power draw, temperature, and fan speed.
+
+    Strategy:
+      1. Try pynvml (fast, in-process)
+      2. Fall back to nvidia-smi subprocess
+      3. Return None values when nothing is available
+    """
+
+    def __init__(self):
+        self._backend: Optional[str] = None
+        self._nvml_handle = None
+        self._gpu_name: Optional[str] = None
+        self._init_pynvml() or self._init_smi()
+
+    # -- initialisation helpers ------------------------------------------------
+
+    def _init_pynvml(self) -> bool:
+        try:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            self._pynvml = pynvml
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            name = pynvml.nvmlDeviceGetName(self._nvml_handle)
+            self._gpu_name = name.decode() if isinstance(name, bytes) else name
+            self._backend = "pynvml"
+            return True
+        except Exception:
+            return False
+
+    def _init_smi(self) -> bool:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+                timeout=5, creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            self._gpu_name = out.decode().strip().split("\n")[0]
+            self._backend = "smi"
+            return True
+        except Exception:
+            return False
+
+    # -- public API ------------------------------------------------------------
+
+    @property
+    def available(self) -> bool:
+        return self._backend is not None
+
+    @property
+    def gpu_name(self) -> Optional[str]:
+        return self._gpu_name
+
+    def query(self) -> Dict[str, object]:
+        """Return {power_w, temp_c, fan_pct} — values are float | int | None."""
+        if self._backend == "pynvml":
+            return self._query_pynvml()
+        if self._backend == "smi":
+            return self._query_smi()
+        return {"power_w": None, "temp_c": None, "fan_pct": None}
+
+    # -- backends --------------------------------------------------------------
+
+    def _query_pynvml(self) -> dict:
+        pynvml = self._pynvml
+        h = self._nvml_handle
+        result: Dict[str, object] = {"power_w": None, "temp_c": None, "fan_pct": None}
+        try:
+            result["power_w"] = round(pynvml.nvmlDeviceGetPowerUsage(h) / 1000.0, 1)
+        except Exception:
+            pass
+        try:
+            result["temp_c"] = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+        except Exception:
+            pass
+        try:
+            result["fan_pct"] = pynvml.nvmlDeviceGetFanSpeed(h)
+        except Exception:
+            pass
+        return result
+
+    def _query_smi(self) -> dict:
+        result: Dict[str, object] = {"power_w": None, "temp_c": None, "fan_pct": None}
+        try:
+            out = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=power.draw,temperature.gpu,fan.speed",
+                    "--format=csv,noheader,nounits",
+                ],
+                timeout=5, creationflags=0x08000000,
+            )
+            parts = out.decode().strip().split(",")
+            if len(parts) >= 1 and parts[0].strip():
+                result["power_w"] = round(float(parts[0].strip()), 1)
+            if len(parts) >= 2 and parts[1].strip():
+                result["temp_c"] = int(float(parts[1].strip()))
+            if len(parts) >= 3 and parts[2].strip():
+                result["fan_pct"] = int(float(parts[2].strip()))
+        except Exception:
+            pass
+        return result
+
+
+# Singleton GPU monitor (initialised once at import time)
+_gpu_monitor = GpuMonitor()
 
 # =============================================================================
 # Colour palette — Meowcoin theme
@@ -400,6 +512,37 @@ class StratumProxyApp:
         self.lbl_uptime = ttk.Label(status_bar, text="—", style="StatusVal.TLabel")
         self.lbl_uptime.pack(side="left")
 
+        # ── GPU stats (right-aligned) ──
+        if _gpu_monitor.available:
+            gpu_short = _gpu_monitor.gpu_name or "GPU"
+            # Truncate long names  e.g. "NVIDIA GeForce RTX 4090" → "RTX 4090"
+            for prefix in ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD "):
+                if gpu_short.startswith(prefix):
+                    gpu_short = gpu_short[len(prefix):]
+                    break
+
+            self.lbl_gpu_fan = ttk.Label(status_bar, text="—", style="StatusVal.TLabel")
+            self.lbl_gpu_fan.pack(side="right", padx=(0, 12))
+            ttk.Label(status_bar, text="Fan:", style="Status.TLabel").pack(
+                side="right", padx=(12, 4))
+
+            self.lbl_gpu_temp = ttk.Label(status_bar, text="—", style="StatusVal.TLabel")
+            self.lbl_gpu_temp.pack(side="right")
+            ttk.Label(status_bar, text="Temp:", style="Status.TLabel").pack(
+                side="right", padx=(12, 4))
+
+            self.lbl_gpu_power = ttk.Label(status_bar, text="—", style="StatusVal.TLabel")
+            self.lbl_gpu_power.pack(side="right")
+            ttk.Label(status_bar, text="Power:", style="Status.TLabel").pack(
+                side="right", padx=(12, 4))
+
+            ttk.Label(status_bar, text=f"⚡ {gpu_short}", style="StatusVal.TLabel").pack(
+                side="right", padx=(12, 4))
+        else:
+            self.lbl_gpu_power = None
+            self.lbl_gpu_temp = None
+            self.lbl_gpu_fan = None
+
         self._start_time: Optional[float] = None
 
     def _make_section_label(self, parent, text):
@@ -519,6 +662,16 @@ class StratumProxyApp:
         elif self.btn_start["state"] == "disabled":
             # Proxy died unexpectedly — reset UI
             self._on_stop()
+
+        # GPU stats — always update (even when proxy stopped, GPU is still there)
+        if self.lbl_gpu_power is not None:
+            stats = _gpu_monitor.query()
+            pw = stats.get("power_w")
+            self.lbl_gpu_power.configure(text=f"{pw} W" if pw is not None else "—")
+            tc = stats.get("temp_c")
+            self.lbl_gpu_temp.configure(text=f"{tc} °C" if tc is not None else "—")
+            fn = stats.get("fan_pct")
+            self.lbl_gpu_fan.configure(text=f"{fn}%" if fn is not None else "—")
 
         self.root.after(1000, self._update_status_loop)
 
