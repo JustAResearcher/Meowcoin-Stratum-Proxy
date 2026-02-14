@@ -874,6 +874,7 @@ class MinerSession:
                 except json.JSONDecodeError:
                     log.warning("Invalid JSON from %s: %s", self.peer, line[:200])
                     continue
+                log.debug("<< %s", json.dumps(msg))
                 await self._handle_message(msg)
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError):
             pass
@@ -905,18 +906,11 @@ class MinerSession:
         miner_agent = params[0] if params else "unknown"
         log.info("Subscribe from %s: agent=%s", self.peer, miner_agent)
 
-        # Response: [[["mining.notify", subscription_id]], extranonce1, extranonce2_size]
-        result = [
-            [["mining.notify", self.subscription_id]],
-            "",   # extranonce1 (empty for solo — miner controls full nonce)
-            8,    # extranonce2_size (bytes)
-        ]
+        # kawpow/EthereumStratum subscribe response:
+        # result: [extranonce_hex, extra_nonce_bytes]
+        # Matches the format used by real kawpow pools (e.g. 2miners)
+        result = [self.subscription_id[:8], "00"]
         await self._send_result(msg_id, result)
-
-        # Send initial target
-        if self.job_manager.current_job:
-            await self.send_set_target(self.job_manager.current_job.target_hex)
-            await self.send_notify(self.job_manager.current_job, clean=True)
 
     async def _handle_authorize(self, msg_id, params):
         self.worker_name = params[0] if params else "unknown"
@@ -924,7 +918,7 @@ class MinerSession:
         log.info("Authorized: %s (%s)", self.worker_name, self.peer)
         await self._send_result(msg_id, True)
 
-        # Send current job after authorization
+        # Send job only after authorization
         if self.job_manager.current_job:
             await self.send_set_target(self.job_manager.current_job.target_hex)
             await self.send_notify(self.job_manager.current_job, clean=True)
@@ -972,20 +966,23 @@ class MinerSession:
         """Send mining.set_target to the miner."""
         await self._send_notification("mining.set_target", [target_hex])
 
+    async def send_set_difficulty(self, difficulty: float):
+        """Send mining.set_difficulty to the miner."""
+        await self._send_notification("mining.set_difficulty", [difficulty])
+
     async def send_notify(self, job: Job, clean: bool = True):
         """
         Send mining.notify with a new job.
-        Standard kawpow 8-param format (NOMP-compatible):
-        [job_id, prev_hash, header_hash, seed_hash, target, clean_jobs, height, bits]
+        kawpow/meowpow 7-param format:
+        [job_id, header_hash, seed_hash, target, clean_jobs, height, bits]
         """
         params = [
             job.job_id,
-            job.prev_hash_hex,
             job.header_hash_hex,
             job.seed_hash_hex,
             job.target_hex,
             clean,
-            job.height,
+            format(job.height, "x"),
             format(job.nbits, "08x"),
         ]
         await self._send_notification("mining.notify", params)
@@ -1006,6 +1003,7 @@ class MinerSession:
             return
         try:
             line = json.dumps(obj) + "\n"
+            log.debug(">> %s", line.rstrip())
             self.writer.write(line.encode("utf-8"))
             await self.writer.drain()
         except (ConnectionResetError, BrokenPipeError, OSError):
