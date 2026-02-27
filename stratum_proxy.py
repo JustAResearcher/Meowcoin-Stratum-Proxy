@@ -627,6 +627,7 @@ BLOCK_LOG_HEADERS = [
     "Block Value (USD)",
     "USD→CAD Rate",
     "Block Value (CAD)",
+    "Coinbase TxID",
     "Worker",
     "Nonce",
     "Cumulative Blocks",
@@ -652,6 +653,7 @@ class BlockLogger:
         fee_sat: int,
         price_usd: Optional[float],
         cad_rate: Optional[float],
+        txid_hex: str,
         worker: str,
         nonce_hex: str,
     ):
@@ -687,7 +689,7 @@ class BlockLogger:
             cum_mewc = total_mewc
             cum_usd = block_usd or 0.0
             cum_cad = block_cad or 0.0
-            for row in ws.iter_rows(min_row=2, max_col=15, values_only=True):
+            for row in ws.iter_rows(min_row=2, max_col=16, values_only=True):
                 if row[4] is not None:  # Total (MEWC) column
                     cum_mewc += float(row[4])
                 if row[6] is not None:  # Block Value (USD) column
@@ -708,6 +710,7 @@ class BlockLogger:
                 round(block_usd, 4) if block_usd else None,
                 round(cad_rate, 4) if cad_rate else None,
                 round(block_cad, 4) if block_cad else None,
+                txid_hex,
                 worker,
                 nonce_hex,
                 cum_blocks,
@@ -725,9 +728,9 @@ class BlockLogger:
             ws.cell(row=row_num, column=7).number_format = '$#,##0.0000'      # USD Value
             ws.cell(row=row_num, column=8).number_format = '#,##0.0000'       # CAD Rate
             ws.cell(row=row_num, column=9).number_format = 'C$#,##0.0000'     # CAD Value
-            ws.cell(row=row_num, column=13).number_format = '#,##0.00000000'  # Cum MEWC
-            ws.cell(row=row_num, column=14).number_format = '$#,##0.0000'     # Cum USD
-            ws.cell(row=row_num, column=15).number_format = 'C$#,##0.0000'    # Cum CAD
+            ws.cell(row=row_num, column=14).number_format = '#,##0.00000000'  # Cum MEWC
+            ws.cell(row=row_num, column=15).number_format = '$#,##0.0000'     # Cum USD
+            ws.cell(row=row_num, column=16).number_format = 'C$#,##0.0000'    # Cum CAD
 
             wb.save(self.filepath)
             log.info(
@@ -1079,18 +1082,17 @@ class JobManager:
             subsidy = get_block_subsidy(job.height)
             community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
             miner_reward = subsidy - community_share
-            # Fee = coinbasevalue from GBT minus miner's base reward
-            # (coinbasevalue already includes fees)
-            # We stored coinbase_raw but not the value directly;
-            # compute fee from the template's coinbasevalue if available.
-            # For simplicity, use height-based subsidy as reward.
             fee_sat = 0  # future: extract from template
+
+            # Compute the coinbase transaction ID
+            coinbase_txid = self._txid_from_raw(job.coinbase_raw)
+            txid_hex = coinbase_txid[::-1].hex()  # display order (big-endian)
 
             log.info(
                 "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
-                "CAD rate=%.4f  (submitblock took %.3fs, total %.3fs)",
+                "CAD rate=%.4f  txid=%s  (submitblock took %.3fs, total %.3fs)",
                 job.height, miner_reward / COIN,
-                price or 0, cad_rate or 0, t2 - t1, t2 - t0,
+                price or 0, cad_rate or 0, txid_hex, t2 - t1, t2 - t0,
             )
 
             self.block_logger.log_block(
@@ -1099,6 +1101,7 @@ class JobManager:
                 fee_sat=fee_sat,
                 price_usd=price,
                 cad_rate=cad_rate,
+                txid_hex=txid_hex,
                 worker=worker,
                 nonce_hex=nonce_hex,
             )
