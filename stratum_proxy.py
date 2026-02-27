@@ -1351,7 +1351,7 @@ def parse_args():
         description="Meowcoin MeowPoW Solo Mining Stratum Proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--address", required=True, help="Meowcoin payout address")
+    p.add_argument("--address", default="", help="Meowcoin payout address")
     p.add_argument("--rpc-host", default="127.0.0.1", help="Node RPC host (default: 127.0.0.1)")
     p.add_argument("--rpc-port", type=int, default=8332, help="Node RPC port (default: 8332)")
     p.add_argument("--rpc-user", default="", help="Node RPC username")
@@ -1366,8 +1366,68 @@ def parse_args():
     return p.parse_args()
 
 
+def _is_frozen():
+    """Return True if running as a PyInstaller bundle."""
+    return getattr(sys, 'frozen', False)
+
+
+def _pause_and_exit(code: int = 1):
+    """Pause so double-clicked exe users can read the error, then exit."""
+    if _is_frozen():
+        print()
+        input("Press Enter to exit...")
+    sys.exit(code)
+
+
+def _interactive_setup(args):
+    """Prompt for required settings when launched without CLI arguments (e.g. double-click)."""
+    print("="*60)
+    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.03")
+    print("="*60)
+    print()
+
+    if not args.address:
+        args.address = input("  Mining address: ").strip()
+        if not args.address:
+            print("\n  ERROR: A Meowcoin address is required.")
+            _pause_and_exit(1)
+
+    rpc_host = input(f"  Node RPC host [{args.rpc_host}]: ").strip()
+    if rpc_host:
+        args.rpc_host = rpc_host
+
+    rpc_port = input(f"  Node RPC port [{args.rpc_port}]: ").strip()
+    if rpc_port:
+        try:
+            args.rpc_port = int(rpc_port)
+        except ValueError:
+            print(f"  Invalid port '{rpc_port}', using default {args.rpc_port}")
+
+    rpc_user = input(f"  RPC username (blank=cookie auth) [{args.rpc_user or ''}]: ").strip()
+    if rpc_user:
+        args.rpc_user = rpc_user
+
+    rpc_pass = input(f"  RPC password (blank=cookie auth) [{args.rpc_pass or ''}]: ").strip()
+    if rpc_pass:
+        args.rpc_pass = rpc_pass
+
+    stratum_port = input(f"  Stratum listen port [{args.stratum_port}]: ").strip()
+    if stratum_port:
+        try:
+            args.stratum_port = int(stratum_port)
+        except ValueError:
+            print(f"  Invalid port '{stratum_port}', using default {args.stratum_port}")
+
+    print()
+    return args
+
+
 def main():
     args = parse_args()
+
+    # If no address provided (e.g. double-clicked exe), run interactive setup
+    if not args.address:
+        args = _interactive_setup(args)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -1381,7 +1441,7 @@ def main():
         log.info("Mining address %s → scriptPubKey %s", args.address, script.hex())
     except Exception as e:
         log.error("Invalid mining address '%s': %s", args.address, e)
-        sys.exit(1)
+        _pause_and_exit(1)
 
     rpc = NodeRPC(
         host=args.rpc_host,
@@ -1402,7 +1462,7 @@ def main():
         )
     except Exception as e:
         log.error("Cannot connect to node RPC: %s", e)
-        sys.exit(1)
+        _pause_and_exit(1)
 
     price_fetcher = MewcPriceFetcher()
     block_logger = BlockLogger(filepath=args.block_log)
@@ -1436,6 +1496,9 @@ def main():
         asyncio.run(server.start())
     except KeyboardInterrupt:
         log.info("Shutting down.")
+    except Exception as e:
+        log.error("Fatal error: %s", e)
+        _pause_and_exit(1)
 
 
 if __name__ == "__main__":
