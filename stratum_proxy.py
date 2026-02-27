@@ -573,6 +573,44 @@ class MewcPriceFetcher:
 
         return self._cached_price  # return stale cache on failure
 
+    # --- USD → CAD conversion rate ---
+    FXRATE_HOST = "open.er-api.com"
+    FXRATE_PATH = "/v6/latest/USD"
+    FXRATE_CACHE_TTL = 3600  # 1 hour — rates don't move fast
+
+    def __init_cad_cache(self):
+        if not hasattr(self, '_cad_rate'):
+            self._cad_rate: Optional[float] = None
+            self._cad_cached_at: float = 0.0
+
+    def get_usd_to_cad(self) -> Optional[float]:
+        """Return the current USD→CAD exchange rate, or None on failure."""
+        self.__init_cad_cache()
+        now = time.time()
+        if self._cad_rate is not None and (now - self._cad_cached_at) < self.FXRATE_CACHE_TTL:
+            return self._cad_rate
+
+        try:
+            ctx = ssl.create_default_context()
+            conn = http.client.HTTPSConnection(
+                self.FXRATE_HOST, 443, timeout=10, context=ctx,
+            )
+            conn.request("GET", self.FXRATE_PATH)
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode())
+            conn.close()
+
+            rate = float(data.get("rates", {}).get("CAD", 0))
+            if rate > 0:
+                self._cad_rate = rate
+                self._cad_cached_at = now
+                log.debug("USD→CAD rate: %.4f", rate)
+                return rate
+        except Exception as e:
+            log.warning("Failed to fetch USD→CAD rate: %s", e)
+
+        return self._cad_rate  # return stale cache on failure
+
 
 # =============================================================================
 # Block logger — append to Excel on each block find
@@ -587,11 +625,14 @@ BLOCK_LOG_HEADERS = [
     "Total (MEWC)",
     "MEWC/USDT Price",
     "Block Value (USD)",
+    "USD→CAD Rate",
+    "Block Value (CAD)",
     "Worker",
     "Nonce",
     "Cumulative Blocks",
     "Cumulative MEWC",
     "Cumulative USD",
+    "Cumulative CAD",
 ]
 
 
@@ -610,6 +651,7 @@ class BlockLogger:
         reward_sat: int,
         fee_sat: int,
         price_usd: Optional[float],
+        cad_rate: Optional[float],
         worker: str,
         nonce_hex: str,
     ):
@@ -622,6 +664,7 @@ class BlockLogger:
         fee_mewc = fee_sat / COIN
         total_mewc = reward_mewc + fee_mewc
         block_usd = total_mewc * price_usd if price_usd else None
+        block_cad = block_usd * cad_rate if (block_usd and cad_rate) else None
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         try:
@@ -643,11 +686,17 @@ class BlockLogger:
             cum_blocks = ws.max_row  # header is row 1, so data rows = max_row - 1, new = max_row
             cum_mewc = total_mewc
             cum_usd = block_usd or 0.0
-            for row in ws.iter_rows(min_row=2, max_col=12, values_only=True):
+            cum_cad = block_cad or 0.0
+            for row in ws.iter_rows(min_row=2, max_col=15, values_only=True):
                 if row[4] is not None:  # Total (MEWC) column
                     cum_mewc += float(row[4])
                 if row[6] is not None:  # Block Value (USD) column
                     cum_usd += float(row[6])
+                if row[8] is not None:  # Block Value (CAD) column
+                    try:
+                        cum_cad += float(row[8])
+                    except (TypeError, ValueError):
+                        pass
 
             ws.append([
                 now_utc,
@@ -657,28 +706,35 @@ class BlockLogger:
                 total_mewc,
                 price_usd,
                 round(block_usd, 4) if block_usd else None,
+                round(cad_rate, 4) if cad_rate else None,
+                round(block_cad, 4) if block_cad else None,
                 worker,
                 nonce_hex,
                 cum_blocks,
                 round(cum_mewc, 8),
                 round(cum_usd, 4),
+                round(cum_cad, 4),
             ])
 
             # Format currency columns
             row_num = ws.max_row
-            ws.cell(row=row_num, column=3).number_format = '#,##0.00000000'  # Reward
-            ws.cell(row=row_num, column=4).number_format = '#,##0.00000000'  # Fees
-            ws.cell(row=row_num, column=5).number_format = '#,##0.00000000'  # Total
-            ws.cell(row=row_num, column=6).number_format = '$#,##0.00000000' # Price
-            ws.cell(row=row_num, column=7).number_format = '$#,##0.0000'     # Value
-            ws.cell(row=row_num, column=11).number_format = '#,##0.00000000' # Cum MEWC
-            ws.cell(row=row_num, column=12).number_format = '$#,##0.0000'    # Cum USD
+            ws.cell(row=row_num, column=3).number_format = '#,##0.00000000'   # Reward
+            ws.cell(row=row_num, column=4).number_format = '#,##0.00000000'   # Fees
+            ws.cell(row=row_num, column=5).number_format = '#,##0.00000000'   # Total
+            ws.cell(row=row_num, column=6).number_format = '$#,##0.00000000'  # USD Price
+            ws.cell(row=row_num, column=7).number_format = '$#,##0.0000'      # USD Value
+            ws.cell(row=row_num, column=8).number_format = '#,##0.0000'       # CAD Rate
+            ws.cell(row=row_num, column=9).number_format = 'C$#,##0.0000'     # CAD Value
+            ws.cell(row=row_num, column=13).number_format = '#,##0.00000000'  # Cum MEWC
+            ws.cell(row=row_num, column=14).number_format = '$#,##0.0000'     # Cum USD
+            ws.cell(row=row_num, column=15).number_format = 'C$#,##0.0000'    # Cum CAD
 
             wb.save(self.filepath)
             log.info(
-                "Block logged to %s: height=%d, reward=%.2f MEWC, price=$%.6f, value=$%.4f",
+                "Block logged to %s: height=%d, reward=%.2f MEWC, "
+                "price=$%.6f, value=$%.4f / C$%.4f",
                 self.filepath, height, total_mewc,
-                price_usd or 0, block_usd or 0,
+                price_usd or 0, block_usd or 0, block_cad or 0,
             )
         except Exception as e:
             log.error("Failed to write block to Excel: %s", e)
@@ -1019,6 +1075,7 @@ class JobManager:
         if result is None:
             # --- Block accepted! Fetch price and log to Excel ---
             price = self.price_fetcher.get_price()
+            cad_rate = self.price_fetcher.get_usd_to_cad()
             subsidy = get_block_subsidy(job.height)
             community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
             miner_reward = subsidy - community_share
@@ -1031,9 +1088,9 @@ class JobManager:
 
             log.info(
                 "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
-                "(submitblock took %.3fs, total %.3fs)",
+                "CAD rate=%.4f  (submitblock took %.3fs, total %.3fs)",
                 job.height, miner_reward / COIN,
-                price or 0, t2 - t1, t2 - t0,
+                price or 0, cad_rate or 0, t2 - t1, t2 - t0,
             )
 
             self.block_logger.log_block(
@@ -1041,6 +1098,7 @@ class JobManager:
                 reward_sat=miner_reward,
                 fee_sat=fee_sat,
                 price_usd=price,
+                cad_rate=cad_rate,
                 worker=worker,
                 nonce_hex=nonce_hex,
             )
@@ -1467,12 +1525,17 @@ def main():
     price_fetcher = MewcPriceFetcher()
     block_logger = BlockLogger(filepath=args.block_log)
 
-    # Fetch initial MEWC price
+    # Fetch initial MEWC price and CAD rate
     price = price_fetcher.get_price()
+    cad_rate = price_fetcher.get_usd_to_cad()
     if price:
         log.info("MEWC/USDT price: $%.6f", price)
     else:
         log.warning("Could not fetch MEWC price — will retry on block find")
+    if cad_rate:
+        log.info("USD→CAD rate: %.4f", cad_rate)
+    else:
+        log.warning("Could not fetch USD→CAD rate — will retry on block find")
 
     log.info("Block finds will be logged to: %s", os.path.abspath(args.block_log))
 
