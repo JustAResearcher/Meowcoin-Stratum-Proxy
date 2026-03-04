@@ -83,6 +83,9 @@ COIN                      = 100_000_000
 PUBKEY_ADDRESS_VERSION    = 50   # 'M' prefix
 SCRIPT_ADDRESS_VERSION    = 122  # 'm' prefix
 BECH32_HRP                = "mewc"
+BECH32_HRP_REGTEST        = "rmewc"
+BECH32_HRP_TESTNET        = "tmewc"
+BECH32_HRPS               = (BECH32_HRP, BECH32_HRP_REGTEST, BECH32_HRP_TESTNET)
 
 log = logging.getLogger("stratum-proxy")
 
@@ -277,10 +280,16 @@ def _convertbits(data, frombits, tobits, pad=True):
 
 def address_to_scriptpubkey(addr: str) -> bytes:
     """Convert a Meowcoin address to its scriptPubKey bytes."""
-    # Bech32 / Bech32m
-    if addr.lower().startswith(BECH32_HRP + "1"):
+    # Bech32 / Bech32m — support mainnet, testnet, and regtest HRPs
+    addr_lower = addr.lower()
+    matched_hrp = None
+    for candidate_hrp in BECH32_HRPS:
+        if addr_lower.startswith(candidate_hrp + "1"):
+            matched_hrp = candidate_hrp
+            break
+    if matched_hrp is not None:
         hrp, data5, spec = bech32_decode(addr)
-        if hrp != BECH32_HRP or data5 is None:
+        if hrp != matched_hrp or data5 is None:
             raise ValueError(f"Invalid bech32 address: {addr}")
         witver = data5[0]
         witprog = bytes(_convertbits(data5[1:], 5, 8, False))
@@ -744,6 +753,91 @@ class BlockLogger:
 
 
 # =============================================================================
+# Discord webhook — notify on block found
+# =============================================================================
+
+class DiscordWebhook:
+    """
+    Sends a rich embed to a Discord channel via webhook URL whenever a block
+    is found.  Silently no-ops if no webhook URL is configured.
+    """
+
+    def __init__(self, webhook_url: Optional[str] = None):
+        self.webhook_url = webhook_url
+
+    def notify_block_found(
+        self,
+        height: int,
+        reward_mewc: float,
+        fee_mewc: float,
+        price_usd: Optional[float],
+        cad_rate: Optional[float],
+        txid_hex: str,
+        worker: str,
+        nonce_hex: str,
+        accepted: bool,
+    ):
+        """Fire-and-forget Discord notification for a block event."""
+        if not self.webhook_url:
+            return
+
+        try:
+            total_mewc = reward_mewc + fee_mewc
+            block_usd = total_mewc * price_usd if price_usd else None
+            block_cad = block_usd * cad_rate if (block_usd and cad_rate) else None
+
+            if accepted:
+                color = 0x00FF00  # green
+                title = f"\u26cf\ufe0f  Block Found — Height {height:,}"
+            else:
+                color = 0xFF0000  # red
+                title = f"\u274c  Block Rejected — Height {height:,}"
+
+            fields = [
+                {"name": "Reward", "value": f"{reward_mewc:,.2f} MEWC", "inline": True},
+                {"name": "Fees", "value": f"{fee_mewc:,.8f} MEWC", "inline": True},
+                {"name": "Total", "value": f"{total_mewc:,.2f} MEWC", "inline": True},
+            ]
+
+            if price_usd:
+                fields.append({"name": "MEWC Price", "value": f"${price_usd:,.8f}", "inline": True})
+            if block_usd is not None:
+                fields.append({"name": "Value (USD)", "value": f"${block_usd:,.4f}", "inline": True})
+            if block_cad is not None:
+                fields.append({"name": "Value (CAD)", "value": f"C${block_cad:,.4f}", "inline": True})
+
+            fields.append({"name": "Worker", "value": worker, "inline": True})
+            fields.append({"name": "Nonce", "value": f"`{nonce_hex}`", "inline": True})
+            fields.append({"name": "Coinbase TxID", "value": f"`{txid_hex[:16]}...`", "inline": False})
+
+            embed = {
+                "title": title,
+                "color": color,
+                "fields": fields,
+                "footer": {"text": "Meowcoin Solo Mining Proxy"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+            payload = {
+                "username": "MEWC Miner",
+                "embeds": [embed],
+            }
+
+            resp = requests.post(
+                self.webhook_url,
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code in (200, 204):
+                log.info("Discord notification sent for block %d", height)
+            else:
+                log.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+
+        except Exception as e:
+            log.error("Discord webhook failed: %s", e)
+
+
+# =============================================================================
 # Job — represents a single mining work unit
 # =============================================================================
 
@@ -824,7 +918,8 @@ class JobManager:
 
     def __init__(self, rpc: NodeRPC, mining_address: str,
                  price_fetcher: Optional[MewcPriceFetcher] = None,
-                 block_logger: Optional[BlockLogger] = None):
+                 block_logger: Optional[BlockLogger] = None,
+                 discord_webhook: Optional[DiscordWebhook] = None):
         self.rpc = rpc
         self.mining_address = mining_address
         self.miner_script = address_to_scriptpubkey(mining_address)
@@ -840,6 +935,7 @@ class JobManager:
         self._reconnect_cooldown: float = 15.0  # Don't try reconnect more than once per 15s
         self.price_fetcher = price_fetcher or MewcPriceFetcher()
         self.block_logger = block_logger or BlockLogger()
+        self.discord_webhook = discord_webhook or DiscordWebhook()
 
     def _try_reconnect_peers(self):
         """When GBT fails with 'not connected', try to add known peers."""
@@ -906,10 +1002,10 @@ class JobManager:
         return self._create_job(tpl)
 
     def _create_job(self, tpl: dict) -> Job:
-        # GBT version is missing VERSIONBITS_TOP_BITS (0x20000000) due to a
-        # SetChainId() bug in the node — add BIP9 signalling bit back so the
-        # block version matches what the rest of the network produces.
-        version   = tpl["version"] | 0x20000000
+        # GBT version is missing top bits due to SetChainId() stripping them.
+        # Meowcoin (Namecoin-derived) needs bit 28 (auxpow-aware) + bit 29
+        # (BIP9 version bits) = 0x30000000 to match network blocks.
+        version   = tpl["version"] | 0x30000000
         height    = tpl["height"]
         nbits     = int(tpl["bits"], 16)
         ntime     = tpl["curtime"]
@@ -1105,8 +1201,32 @@ class JobManager:
                 worker=worker,
                 nonce_hex=nonce_hex,
             )
+
+            self.discord_webhook.notify_block_found(
+                height=job.height,
+                reward_mewc=miner_reward / COIN,
+                fee_mewc=fee_sat / COIN,
+                price_usd=price,
+                cad_rate=cad_rate,
+                txid_hex=txid_hex,
+                worker=worker,
+                nonce_hex=nonce_hex,
+                accepted=True,
+            )
         else:
             log.warning("Block rejected: %s  (submitblock took %.3fs)", result, t2 - t1)
+
+            self.discord_webhook.notify_block_found(
+                height=job.height,
+                reward_mewc=0,
+                fee_mewc=0,
+                price_usd=None,
+                cad_rate=None,
+                txid_hex="",
+                worker=worker,
+                nonce_hex=nonce_hex,
+                accepted=False,
+            )
 
         return result if result is not None else "accepted"
 
@@ -1424,6 +1544,8 @@ def parse_args():
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--block-log", default="block_finds.xlsx",
                    help="Excel file for block find log (default: block_finds.xlsx)")
+    p.add_argument("--discord-webhook", default="",
+                   help="Discord webhook URL for block-found notifications")
     return p.parse_args()
 
 
@@ -1542,9 +1664,14 @@ def main():
 
     log.info("Block finds will be logged to: %s", os.path.abspath(args.block_log))
 
+    discord_webhook = DiscordWebhook(webhook_url=args.discord_webhook or None)
+    if args.discord_webhook:
+        log.info("Discord webhook notifications enabled")
+
     job_mgr = JobManager(rpc, args.address,
                          price_fetcher=price_fetcher,
-                         block_logger=block_logger)
+                         block_logger=block_logger,
+                         discord_webhook=discord_webhook)
     server = StratumServer(
         job_manager=job_mgr,
         host=args.stratum_host,
