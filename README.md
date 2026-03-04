@@ -66,6 +66,7 @@ python stratum_proxy.py --address <YOUR_MEWC_ADDRESS> [options]
 | `--poll-interval`  | `1.0`         | GBT poll interval in seconds               |
 | `--log-level`      | `INFO`        | Logging: DEBUG, INFO, WARNING, ERROR       |
 | `--block-log`      | `block_finds.xlsx` | Excel file for block find history      |
+| `--discord-webhook`| *(disabled)*       | Discord webhook URL for block-found notifications |
 
 ### Example
 
@@ -152,6 +153,100 @@ Each row records:
 | Cumulative USD | $0.5415 |
 
 The file is created automatically on the first block find. Subsequent blocks append rows with running cumulative totals.
+
+## Discord Webhook Notifications
+
+The proxy can send real-time block-found alerts to a Discord channel via a
+webhook. Pass `--discord-webhook <URL>` to enable it.
+
+### Setup
+
+1. In your Discord server, go to **Server Settings → Integrations → Webhooks**
+2. Click **New Webhook**, pick a channel, and copy the webhook URL
+3. Start the proxy with the webhook flag:
+
+```powershell
+python stratum_proxy.py ^
+    --address MPyNGZSSZ4rbjkVJRLn3v64pMcktpEYJnU ^
+    --discord-webhook "https://discord.com/api/webhooks/123456789/abcdef..."
+```
+
+Or with the standalone EXE:
+
+```powershell
+meowcoin-stratum-proxy.exe ^
+    --address MPyNGZSSZ4rbjkVJRLn3v64pMcktpEYJnU ^
+    --discord-webhook "https://discord.com/api/webhooks/123456789/abcdef..."
+```
+
+### How It Works
+
+The `DiscordWebhook` class lives inside `stratum_proxy.py` and hooks into the
+block-submission pipeline:
+
+```
+Miner submits solution
+        │
+        ▼
+Proxy assembles full block
+        │
+        ▼
+submitblock RPC → Meowcoin Node
+        │
+   ┌────┴────┐
+   │         │
+Accepted  Rejected
+   │         │
+   ▼         ▼
+Green embed  Red embed
+sent to      sent to
+Discord      Discord
+```
+
+1. **Block accepted** — A **green** embed is posted with the block height,
+   reward, fees, live MEWC price (from NonKYC.io), USD/CAD value, worker name,
+   nonce, and the coinbase transaction ID.
+2. **Block rejected** — A **red** embed is posted with the height, worker, and
+   nonce so you can investigate.
+3. **No webhook URL** — If `--discord-webhook` is omitted, the class silently
+   no-ops. There is zero overhead.
+
+The notification is **fire-and-forget** — a failed HTTP request is logged but
+never blocks mining. The webhook call uses a 10-second timeout to avoid hangs.
+
+### Embed Fields
+
+| Field | Description | When |
+|---|---|---|
+| **Reward** | Block subsidy in MEWC | Accepted |
+| **Fees** | Total transaction fees in MEWC | Accepted |
+| **Total** | Reward + Fees | Accepted |
+| **MEWC Price** | Live MEWC/USDT from NonKYC.io | If price available |
+| **Value (USD)** | Total MEWC × price | If price available |
+| **Value (CAD)** | USD value × CAD exchange rate | If CAD rate available |
+| **Worker** | Miner worker name | Always |
+| **Nonce** | Solution nonce (hex) | Always |
+| **Coinbase TxID** | First 16 chars of the coinbase txid | Accepted |
+
+### Example Embed
+
+> **⛏️  Block Found — Height 123,456**
+>
+> | Reward | Fees | Total |
+> |---|---|---|
+> | 3,000.00 MEWC | 0.50000000 MEWC | 3,000.50 MEWC |
+>
+> | MEWC Price | Value (USD) | Value (CAD) |
+> |---|---|---|
+> | $0.00003608 | $0.1083 | C$0.1480 |
+>
+> | Worker | Nonce |
+> |---|---|
+> | rig1 | `deadbeef12345678` |
+>
+> **Coinbase TxID:** `a1b2c3d4e5f6g7h8...`
+>
+> *Meowcoin Solo Mining Proxy — 2026-03-04T12:00:00Z*
 
 ## Consensus Details
 
