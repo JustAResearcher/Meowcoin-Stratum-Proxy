@@ -1584,7 +1584,7 @@ def _pause_and_exit(code: int = 1):
 def _interactive_setup(args):
     """Prompt for required settings when launched without CLI arguments (e.g. double-click)."""
     print("="*60)
-    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.04")
+    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.05")
     print("="*60)
     print()
 
