@@ -680,15 +680,27 @@ class BlockLogger:
 
         try:
             # Load existing workbook or create new
-            try:
-                wb = openpyxl.load_workbook(self.filepath)
-                ws = wb.active
-            except FileNotFoundError:
+            if os.path.exists(self.filepath):
+                try:
+                    wb = openpyxl.load_workbook(self.filepath)
+                    ws = wb.active
+                except Exception as load_err:
+                    log.warning(
+                        "Could not load existing %s (%s) — creating new file",
+                        self.filepath, load_err,
+                    )
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Block Finds"
+                    ws.append(BLOCK_LOG_HEADERS)
+                    from openpyxl.styles import Font, numbers
+                    for cell in ws[1]:
+                        cell.font = Font(bold=True)
+            else:
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.title = "Block Finds"
                 ws.append(BLOCK_LOG_HEADERS)
-                # Bold headers and auto-width
                 from openpyxl.styles import Font, numbers
                 for cell in ws[1]:
                     cell.font = Font(bold=True)
@@ -1171,48 +1183,55 @@ class JobManager:
             return str(e)
 
         t2 = time.time()
-        if result is None:
+        # submitblock returns null on success; some node versions return ""
+        if result is None or result == "":
             # --- Block accepted! Fetch price and log to Excel ---
-            price = self.price_fetcher.get_price()
-            cad_rate = self.price_fetcher.get_usd_to_cad()
-            subsidy = get_block_subsidy(job.height)
-            community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
-            miner_reward = subsidy - community_share
-            fee_sat = 0  # future: extract from template
+            try:
+                price = self.price_fetcher.get_price()
+                cad_rate = self.price_fetcher.get_usd_to_cad()
+                subsidy = get_block_subsidy(job.height)
+                community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
+                miner_reward = subsidy - community_share
+                fee_sat = 0  # future: extract from template
 
-            # Compute the coinbase transaction ID
-            coinbase_txid = self._txid_from_raw(job.coinbase_raw)
-            txid_hex = coinbase_txid[::-1].hex()  # display order (big-endian)
+                # Compute the coinbase transaction ID
+                coinbase_txid = self._txid_from_raw(job.coinbase_raw)
+                txid_hex = coinbase_txid[::-1].hex()  # display order (big-endian)
 
-            log.info(
-                "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
-                "CAD rate=%.4f  txid=%s  (submitblock took %.3fs, total %.3fs)",
-                job.height, miner_reward / COIN,
-                price or 0, cad_rate or 0, txid_hex, t2 - t1, t2 - t0,
-            )
+                log.info(
+                    "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
+                    "CAD rate=%.4f  txid=%s  (submitblock took %.3fs, total %.3fs)",
+                    job.height, miner_reward / COIN,
+                    price or 0, cad_rate or 0, txid_hex, t2 - t1, t2 - t0,
+                )
 
-            self.block_logger.log_block(
-                height=job.height,
-                reward_sat=miner_reward,
-                fee_sat=fee_sat,
-                price_usd=price,
-                cad_rate=cad_rate,
-                txid_hex=txid_hex,
-                worker=worker,
-                nonce_hex=nonce_hex,
-            )
+                self.block_logger.log_block(
+                    height=job.height,
+                    reward_sat=miner_reward,
+                    fee_sat=fee_sat,
+                    price_usd=price,
+                    cad_rate=cad_rate,
+                    txid_hex=txid_hex,
+                    worker=worker,
+                    nonce_hex=nonce_hex,
+                )
 
-            self.discord_webhook.notify_block_found(
-                height=job.height,
-                reward_mewc=miner_reward / COIN,
-                fee_mewc=fee_sat / COIN,
-                price_usd=price,
-                cad_rate=cad_rate,
-                txid_hex=txid_hex,
-                worker=worker,
-                nonce_hex=nonce_hex,
-                accepted=True,
-            )
+                self.discord_webhook.notify_block_found(
+                    height=job.height,
+                    reward_mewc=miner_reward / COIN,
+                    fee_mewc=fee_sat / COIN,
+                    price_usd=price,
+                    cad_rate=cad_rate,
+                    txid_hex=txid_hex,
+                    worker=worker,
+                    nonce_hex=nonce_hex,
+                    accepted=True,
+                )
+            except Exception as e:
+                log.error(
+                    "Block accepted at height %d but post-accept processing "
+                    "failed: %s\n%s", job.height, e, traceback.format_exc(),
+                )
         else:
             log.warning("Block rejected: %s  (submitblock took %.3fs)", result, t2 - t1)
 
@@ -1228,7 +1247,7 @@ class JobManager:
                 accepted=False,
             )
 
-        return result if result is not None else "accepted"
+        return "accepted" if (result is None or result == "") else result
 
 
 def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
@@ -1565,7 +1584,7 @@ def _pause_and_exit(code: int = 1):
 def _interactive_setup(args):
     """Prompt for required settings when launched without CLI arguments (e.g. double-click)."""
     print("="*60)
-    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.03")
+    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.04")
     print("="*60)
     print()
 
