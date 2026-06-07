@@ -643,6 +643,7 @@ BLOCK_LOG_HEADERS = [
     "Cumulative MEWC",
     "Cumulative USD",
     "Cumulative CAD",
+    "Status",
 ]
 
 
@@ -665,8 +666,10 @@ class BlockLogger:
         txid_hex: str,
         worker: str,
         nonce_hex: str,
+        accepted: bool = True,
+        status: str = "Accepted",
     ):
-        """Append a block-find row to the Excel file."""
+        """Append a block-find row to the Excel file (accepted or rejected)."""
         if openpyxl is None:
             log.warning("openpyxl not installed — cannot log block to Excel")
             return
@@ -684,6 +687,11 @@ class BlockLogger:
                 try:
                     wb = openpyxl.load_workbook(self.filepath)
                     ws = wb.active
+                    # Upgrade legacy logs that predate the "Status" column
+                    if ws.cell(row=1, column=len(BLOCK_LOG_HEADERS)).value != "Status":
+                        from openpyxl.styles import Font as _Font
+                        hcell = ws.cell(row=1, column=len(BLOCK_LOG_HEADERS), value="Status")
+                        hcell.font = _Font(bold=True)
                 except Exception as load_err:
                     log.warning(
                         "Could not load existing %s (%s) — creating new file",
@@ -705,21 +713,40 @@ class BlockLogger:
                 for cell in ws[1]:
                     cell.font = Font(bold=True)
 
-            # Calculate cumulative totals from existing rows
-            cum_blocks = ws.max_row  # header is row 1, so data rows = max_row - 1, new = max_row
-            cum_mewc = total_mewc
-            cum_usd = block_usd or 0.0
-            cum_cad = block_cad or 0.0
-            for row in ws.iter_rows(min_row=2, max_col=16, values_only=True):
-                if row[4] is not None:  # Total (MEWC) column
-                    cum_mewc += float(row[4])
-                if row[6] is not None:  # Block Value (USD) column
-                    cum_usd += float(row[6])
-                if row[8] is not None:  # Block Value (CAD) column
+            # Cumulative totals reflect ACCEPTED blocks only — rejected/stale
+            # finds earn nothing, so they must not inflate the running totals.
+            cum_blocks = 0
+            cum_mewc = 0.0
+            cum_usd = 0.0
+            cum_cad = 0.0
+            for row in ws.iter_rows(min_row=2, max_col=len(BLOCK_LOG_HEADERS), values_only=True):
+                row_status = row[16] if len(row) > 16 else None
+                # Legacy rows (written before the Status column existed) were
+                # all accepted blocks, so treat a blank status as accepted.
+                is_acc = (row_status is None) or str(row_status).strip().lower().startswith("accept")
+                if not is_acc:
+                    continue
+                cum_blocks += 1
+                if row[4] is not None:   # Total (MEWC)
+                    try:
+                        cum_mewc += float(row[4])
+                    except (TypeError, ValueError):
+                        pass
+                if row[6] is not None:   # Block Value (USD)
+                    try:
+                        cum_usd += float(row[6])
+                    except (TypeError, ValueError):
+                        pass
+                if row[8] is not None:   # Block Value (CAD)
                     try:
                         cum_cad += float(row[8])
                     except (TypeError, ValueError):
                         pass
+            if accepted:
+                cum_blocks += 1
+                cum_mewc += total_mewc
+                cum_usd += (block_usd or 0.0)
+                cum_cad += (block_cad or 0.0)
 
             ws.append([
                 now_utc,
@@ -738,6 +765,7 @@ class BlockLogger:
                 round(cum_mewc, 8),
                 round(cum_usd, 4),
                 round(cum_cad, 4),
+                status,
             ])
 
             # Format currency columns
@@ -753,12 +781,50 @@ class BlockLogger:
             ws.cell(row=row_num, column=15).number_format = '$#,##0.0000'     # Cum USD
             ws.cell(row=row_num, column=16).number_format = 'C$#,##0.0000'    # Cum CAD
 
-            wb.save(self.filepath)
+            # Save with retry — the workbook is often open in Excel, which
+            # locks the file on Windows (PermissionError).  Never drop a find.
+            saved = False
+            last_err: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    wb.save(self.filepath)
+                    saved = True
+                    break
+                except PermissionError as e:
+                    last_err = e
+                    log.warning(
+                        "Excel file '%s' is locked (open in another program?) "
+                        "— retry %d/3", self.filepath, attempt + 1,
+                    )
+                    time.sleep(0.5)
+                except Exception as e:
+                    last_err = e
+                    break
+
+            if not saved:
+                # Fallback to a timestamped file so the block find is preserved.
+                base, ext = os.path.splitext(self.filepath)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                fallback = f"{base}.{stamp}{ext or '.xlsx'}"
+                try:
+                    wb.save(fallback)
+                    log.error(
+                        "Could not write '%s' (%s).  Saved this block to '%s' "
+                        "instead — close the spreadsheet to resume normal "
+                        "logging.", self.filepath, last_err, fallback,
+                    )
+                except Exception as e2:
+                    log.error(
+                        "FAILED to log block at height %d to Excel "
+                        "(primary=%s, fallback=%s)", height, last_err, e2,
+                    )
+                return
+
             log.info(
-                "Block logged to %s: height=%d, reward=%.2f MEWC, "
-                "price=$%.6f, value=$%.4f / C$%.4f",
-                self.filepath, height, total_mewc,
-                price_usd or 0, block_usd or 0, block_cad or 0,
+                "Block logged to %s: height=%d status=%s reward=%.2f MEWC "
+                "value=$%.4f / C$%.4f",
+                self.filepath, height, status, total_mewc,
+                block_usd or 0, block_cad or 0,
             )
         except Exception as e:
             log.error("Failed to write block to Excel: %s", e)
@@ -788,6 +854,7 @@ class DiscordWebhook:
         worker: str,
         nonce_hex: str,
         accepted: bool,
+        status: str = "",
     ):
         """Fire-and-forget Discord notification for a block event."""
         if not self.webhook_url:
@@ -797,6 +864,11 @@ class DiscordWebhook:
             total_mewc = reward_mewc + fee_mewc
             block_usd = total_mewc * price_usd if price_usd else None
             block_cad = block_usd * cad_rate if (block_usd and cad_rate) else None
+
+            # Discord rejects an embed if ANY field value is empty (HTTP 400),
+            # which silently drops the whole notification.  Never send blanks.
+            worker_display = worker if worker else "unknown"
+            nonce_display = nonce_hex if nonce_hex else "—"
 
             if accepted:
                 color = 0x00FF00  # green
@@ -818,9 +890,13 @@ class DiscordWebhook:
             if block_cad is not None:
                 fields.append({"name": "Value (CAD)", "value": f"C${block_cad:,.4f}", "inline": True})
 
-            fields.append({"name": "Worker", "value": worker, "inline": True})
-            fields.append({"name": "Nonce", "value": f"`{nonce_hex}`", "inline": True})
-            fields.append({"name": "Coinbase TxID", "value": f"`{txid_hex[:16]}...`", "inline": False})
+            fields.append({"name": "Worker", "value": worker_display, "inline": True})
+            fields.append({"name": "Nonce", "value": f"`{nonce_display}`", "inline": True})
+            if txid_hex:
+                fields.append({"name": "Coinbase TxID", "value": f"`{txid_hex[:16]}...`", "inline": False})
+            if not accepted and status:
+                reason = status.split("Rejected:", 1)[-1].strip() or status
+                fields.append({"name": "Reason", "value": reason[:1024], "inline": False})
 
             embed = {
                 "title": title,
@@ -835,15 +911,25 @@ class DiscordWebhook:
                 "embeds": [embed],
             }
 
-            resp = requests.post(
-                self.webhook_url,
-                json=payload,
-                timeout=10,
-            )
-            if resp.status_code in (200, 204):
-                log.info("Discord notification sent for block %d", height)
-            else:
+            # Post with one retry on rate-limit (429); otherwise fire-and-forget.
+            for attempt in range(2):
+                resp = requests.post(self.webhook_url, json=payload, timeout=10)
+                if resp.status_code in (200, 204):
+                    log.info(
+                        "Discord notification sent for block %d (%s)",
+                        height, "accepted" if accepted else "rejected",
+                    )
+                    return
+                if resp.status_code == 429 and attempt == 0:
+                    try:
+                        retry_after = float(resp.json().get("retry_after", 1.0))
+                    except Exception:
+                        retry_after = 1.0
+                    log.warning("Discord rate-limited; retrying in %.1fs", retry_after)
+                    time.sleep(min(retry_after, 5.0))
+                    continue
                 log.warning("Discord webhook returned %d: %s", resp.status_code, resp.text[:200])
+                return
 
         except Exception as e:
             log.error("Discord webhook failed: %s", e)
@@ -1184,70 +1270,80 @@ class JobManager:
 
         t2 = time.time()
         # submitblock returns null on success; some node versions return ""
-        if result is None or result == "":
-            # --- Block accepted! Fetch price and log to Excel ---
-            try:
-                price = self.price_fetcher.get_price()
-                cad_rate = self.price_fetcher.get_usd_to_cad()
-                subsidy = get_block_subsidy(job.height)
-                community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
-                miner_reward = subsidy - community_share
-                fee_sat = 0  # future: extract from template
+        accepted = result is None or result == ""
+        status = "Accepted" if accepted else f"Rejected: {result}"
 
-                # Compute the coinbase transaction ID
-                coinbase_txid = self._txid_from_raw(job.coinbase_raw)
-                txid_hex = coinbase_txid[::-1].hex()  # display order (big-endian)
+        # Gather block metadata for logging + notification (best-effort: a
+        # failure here must never stop us recording that a block was found).
+        try:
+            price = self.price_fetcher.get_price()
+        except Exception:
+            price = None
+        try:
+            cad_rate = self.price_fetcher.get_usd_to_cad()
+        except Exception:
+            cad_rate = None
+        subsidy = get_block_subsidy(job.height)
+        community_share = (subsidy * COMMUNITY_FUND_PCT) // 100
+        miner_reward = subsidy - community_share
+        fee_sat = 0  # future: extract from template
+        try:
+            coinbase_txid = self._txid_from_raw(job.coinbase_raw)
+            txid_hex = coinbase_txid[::-1].hex()  # display order (big-endian)
+        except Exception:
+            txid_hex = ""
 
-                log.info(
-                    "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
-                    "CAD rate=%.4f  txid=%s  (submitblock took %.3fs, total %.3fs)",
-                    job.height, miner_reward / COIN,
-                    price or 0, cad_rate or 0, txid_hex, t2 - t1, t2 - t0,
-                )
-
-                self.block_logger.log_block(
-                    height=job.height,
-                    reward_sat=miner_reward,
-                    fee_sat=fee_sat,
-                    price_usd=price,
-                    cad_rate=cad_rate,
-                    txid_hex=txid_hex,
-                    worker=worker,
-                    nonce_hex=nonce_hex,
-                )
-
-                self.discord_webhook.notify_block_found(
-                    height=job.height,
-                    reward_mewc=miner_reward / COIN,
-                    fee_mewc=fee_sat / COIN,
-                    price_usd=price,
-                    cad_rate=cad_rate,
-                    txid_hex=txid_hex,
-                    worker=worker,
-                    nonce_hex=nonce_hex,
-                    accepted=True,
-                )
-            except Exception as e:
-                log.error(
-                    "Block accepted at height %d but post-accept processing "
-                    "failed: %s\n%s", job.height, e, traceback.format_exc(),
-                )
+        if accepted:
+            log.info(
+                "*** BLOCK ACCEPTED ***  height=%d  reward=%.2f MEWC  price=$%.6f  "
+                "CAD rate=%.4f  txid=%s  (submitblock took %.3fs, total %.3fs)",
+                job.height, miner_reward / COIN,
+                price or 0, cad_rate or 0, txid_hex, t2 - t1, t2 - t0,
+            )
         else:
-            log.warning("Block rejected: %s  (submitblock took %.3fs)", result, t2 - t1)
-
-            self.discord_webhook.notify_block_found(
-                height=job.height,
-                reward_mewc=0,
-                fee_mewc=0,
-                price_usd=None,
-                cad_rate=None,
-                txid_hex="",
-                worker=worker,
-                nonce_hex=nonce_hex,
-                accepted=False,
+            log.warning(
+                "*** BLOCK REJECTED ***  height=%d  reason=%s  (submitblock took %.3fs)",
+                job.height, result, t2 - t1,
             )
 
-        return "accepted" if (result is None or result == "") else result
+        # Record EVERY solution (accepted or rejected) to the Excel log...
+        try:
+            self.block_logger.log_block(
+                height=job.height,
+                reward_sat=miner_reward,
+                fee_sat=fee_sat,
+                price_usd=price,
+                cad_rate=cad_rate,
+                txid_hex=txid_hex,
+                worker=worker,
+                nonce_hex=nonce_hex,
+                accepted=accepted,
+                status=status,
+            )
+        except Exception as e:
+            log.error(
+                "Block at height %d found but Excel logging failed: %s\n%s",
+                job.height, e, traceback.format_exc(),
+            )
+
+        # ...and to Discord.
+        try:
+            self.discord_webhook.notify_block_found(
+                height=job.height,
+                reward_mewc=miner_reward / COIN,
+                fee_mewc=fee_sat / COIN,
+                price_usd=price,
+                cad_rate=cad_rate,
+                txid_hex=txid_hex,
+                worker=worker,
+                nonce_hex=nonce_hex,
+                accepted=accepted,
+                status=status,
+            )
+        except Exception as e:
+            log.error("Discord notification failed at height %d: %s", job.height, e)
+
+        return "accepted" if accepted else result
 
 
 def _read_varint(data: bytes, pos: int) -> Tuple[int, int]:
@@ -1546,24 +1642,74 @@ class StratumServer:
 # Main
 # =============================================================================
 
-def parse_args():
+CONFIG_FILENAME = "meowcoin_proxy_config.json"
+
+# Settings persisted to / loaded from the JSON config (argparse dest names).
+_CONFIG_KEYS = (
+    "address", "rpc_host", "rpc_port", "rpc_user", "rpc_pass",
+    "cookie_dir", "stratum_host", "stratum_port", "poll_interval",
+    "log_level", "block_log", "discord_webhook",
+)
+
+
+def _app_base_dir() -> str:
+    """Directory of the running exe (when frozen) or this script."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def load_config(path: str) -> dict:
+    """Load saved settings from the JSON config (empty dict if absent/bad)."""
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"  (Could not read config {path}: {e})")
+    return {}
+
+
+def save_config(args, path: str) -> None:
+    """Persist the current settings so the next launch remembers them."""
+    try:
+        data = {
+            k: getattr(args, k)
+            for k in _CONFIG_KEYS
+            if getattr(args, k, "") not in ("", None)
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        print(f"  Settings saved to {path}")
+    except Exception as e:
+        print(f"  (Could not save config {path}: {e})")
+
+
+def parse_args(config: Optional[dict] = None):
+    config = config or {}
+
+    def d(key, fallback):
+        return config.get(key, fallback)
+
     p = argparse.ArgumentParser(
         description="Meowcoin MeowPoW Solo Mining Stratum Proxy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--address", default="", help="Meowcoin payout address")
-    p.add_argument("--rpc-host", default="127.0.0.1", help="Node RPC host (default: 127.0.0.1)")
-    p.add_argument("--rpc-port", type=int, default=8332, help="Node RPC port (default: 8332)")
-    p.add_argument("--rpc-user", default="", help="Node RPC username")
-    p.add_argument("--rpc-pass", default="", help="Node RPC password")
-    p.add_argument("--cookie-dir", default="", help="Data directory containing .cookie file")
-    p.add_argument("--stratum-host", default="0.0.0.0", help="Stratum listen host (default: 0.0.0.0)")
-    p.add_argument("--stratum-port", type=int, default=3333, help="Stratum listen port (default: 3333)")
-    p.add_argument("--poll-interval", type=float, default=1.0, help="GBT poll interval in seconds (default: 1.0)")
-    p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    p.add_argument("--block-log", default="block_finds.xlsx",
+    p.add_argument("--address", default=d("address", ""), help="Meowcoin payout address")
+    p.add_argument("--rpc-host", default=d("rpc_host", "127.0.0.1"), help="Node RPC host (default: 127.0.0.1)")
+    p.add_argument("--rpc-port", type=int, default=d("rpc_port", 8332), help="Node RPC port (default: 8332)")
+    p.add_argument("--rpc-user", default=d("rpc_user", ""), help="Node RPC username")
+    p.add_argument("--rpc-pass", default=d("rpc_pass", ""), help="Node RPC password")
+    p.add_argument("--cookie-dir", default=d("cookie_dir", ""), help="Data directory containing .cookie file")
+    p.add_argument("--stratum-host", default=d("stratum_host", "0.0.0.0"), help="Stratum listen host (default: 0.0.0.0)")
+    p.add_argument("--stratum-port", type=int, default=d("stratum_port", 3333), help="Stratum listen port (default: 3333)")
+    p.add_argument("--poll-interval", type=float, default=d("poll_interval", 1.0), help="GBT poll interval in seconds (default: 1.0)")
+    p.add_argument("--log-level", default=d("log_level", "INFO"), choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p.add_argument("--block-log", default=d("block_log", "block_finds.xlsx"),
                    help="Excel file for block find log (default: block_finds.xlsx)")
-    p.add_argument("--discord-webhook", default="",
+    p.add_argument("--discord-webhook", default=d("discord_webhook", ""),
                    help="Discord webhook URL for block-found notifications")
     return p.parse_args()
 
@@ -1584,15 +1730,17 @@ def _pause_and_exit(code: int = 1):
 def _interactive_setup(args):
     """Prompt for required settings when launched without CLI arguments (e.g. double-click)."""
     print("="*60)
-    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.05")
+    print("  Meowcoin MeowPoW Solo Mining Stratum Proxy  v1.06")
     print("="*60)
+    print("  Press Enter to keep the [saved] value shown in brackets.")
     print()
 
+    address = input(f"  Mining address [{args.address or 'required'}]: ").strip()
+    if address:
+        args.address = address
     if not args.address:
-        args.address = input("  Mining address: ").strip()
-        if not args.address:
-            print("\n  ERROR: A Meowcoin address is required.")
-            _pause_and_exit(1)
+        print("\n  ERROR: A Meowcoin address is required.")
+        _pause_and_exit(1)
 
     rpc_host = input(f"  Node RPC host [{args.rpc_host}]: ").strip()
     if rpc_host:
@@ -1613,6 +1761,10 @@ def _interactive_setup(args):
     if rpc_pass:
         args.rpc_pass = rpc_pass
 
+    cookie_dir = input(f"  Node data dir for cookie auth (blank=auto) [{args.cookie_dir or ''}]: ").strip()
+    if cookie_dir:
+        args.cookie_dir = cookie_dir
+
     stratum_port = input(f"  Stratum listen port [{args.stratum_port}]: ").strip()
     if stratum_port:
         try:
@@ -1620,16 +1772,34 @@ def _interactive_setup(args):
         except ValueError:
             print(f"  Invalid port '{stratum_port}', using default {args.stratum_port}")
 
+    block_log = input(f"  Block-find Excel file [{args.block_log}]: ").strip()
+    if block_log:
+        args.block_log = block_log
+
+    wh_hint = "[saved] — Enter keeps it, or paste a new URL" if args.discord_webhook else "blank = disabled"
+    discord = input(f"  Discord webhook URL ({wh_hint}): ").strip()
+    if discord:
+        args.discord_webhook = discord
+
     print()
     return args
 
 
 def main():
-    args = parse_args()
+    config_path = os.path.join(_app_base_dir(), CONFIG_FILENAME)
+    config = load_config(config_path)
+    args = parse_args(config)
 
-    # If no address provided (e.g. double-clicked exe), run interactive setup
-    if not args.address:
+    # Run interactive setup when double-clicked (no CLI args) or no address yet.
+    # Saved values pre-fill the prompts, and the answers are remembered.
+    if len(sys.argv) == 1 or not args.address:
         args = _interactive_setup(args)
+        save_config(args, config_path)
+
+    # Resolve a relative block-log path next to the exe/script so a
+    # double-click writes to a predictable location, not a stray working dir.
+    if args.block_log and not os.path.isabs(args.block_log):
+        args.block_log = os.path.join(_app_base_dir(), args.block_log)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

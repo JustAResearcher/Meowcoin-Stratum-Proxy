@@ -154,6 +154,8 @@ Each row records:
 
 The file is created automatically on the first block find. Subsequent blocks append rows with running cumulative totals.
 
+**Every solution is recorded** — both **accepted** blocks and any the node **rejects** (e.g. stale/duplicate) — tagged in a **Status** column (the last column). Cumulative totals count accepted blocks only. If the spreadsheet happens to be open in Excel when a block is found (Windows locks the file), the row is written to a timestamped fallback file (`block_finds.<timestamp>.xlsx`) instead, so a find is never lost. The log is created next to the proxy executable.
+
 ## Discord Webhook Notifications
 
 The proxy can send real-time block-found alerts to a Discord channel via a
@@ -178,6 +180,11 @@ meowcoin-stratum-proxy.exe ^
     --address MPyNGZSSZ4rbjkVJRLn3v64pMcktpEYJnU ^
     --discord-webhook "https://discord.com/api/webhooks/123456789/abcdef..."
 ```
+
+> **Double-click / no command-line flags?** The proxy now **prompts** for the
+> webhook URL (and the other settings) on launch and **remembers them** in
+> `meowcoin_proxy_config.json` next to the executable, so later launches reuse
+> them. Press Enter at any prompt to keep the saved value.
 
 ### How It Works
 
